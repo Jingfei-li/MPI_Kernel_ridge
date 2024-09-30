@@ -1,0 +1,116 @@
+# import  libraries 
+import pandas as pd
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.preprocessing import StandardScaler
+from sklearn.kernel_ridge import KernelRidge
+from sklearn.metrics import mean_squared_error
+import numpy as np
+from mpi4py import MPI
+
+# MPI initializing
+comm = MPI.COMM_WORLD  # Initialize MPI communicator
+rank = comm.Get_rank()  # Get the process rank (ID)
+size = comm.Get_size()  # Get the total number of processes
+print(f"Hello from process {rank} out of {size}")
+
+# master processor has Rank 0, read the data
+if rank == 0:
+    try:
+        data = pd.read_csv('housing.tsv', delimiter='\t')
+        print("Data loaded successfully.")
+    except Exception as e:   #  handling the case if the file doesn't exit
+        print(f"Failed to load data: {e}")
+        data = None
+else:
+    data = None
+
+# broadcast to all processors 
+data = comm.bcast(data, root=0)
+
+
+# spliting x and y values
+X = data.iloc[:, :-1].values #matrix first  9 columns
+y = data.iloc[:, -1].values
+
+# standardlizing
+if rank == 0:
+    scaler = StandardScaler()
+    X = scaler.fit_transform(X)
+    print("Data standardization completed.")
+
+# broadcast to all processors after standardlizing
+X = comm.bcast(X, root=0)
+y = comm.bcast(y, root=0)
+
+# Split the dataset into the training data (70%) and the test data (30%).
+if rank == 0:
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42)
+    print("Split the dataset into the training data (70%) and the test data (30%).")
+else:
+    X_train, X_test, y_train, y_test = None, None, None, None
+
+X_train_split = np.array_split(X_train, size, axis=0) if rank == 0 else None
+y_train_split = np.array_split(y_train, size) if rank == 0 else None
+
+# other processors get the split part of data
+X_train_local = comm.scatter(X_train_split, root=0)
+y_train_local = comm.scatter(y_train_split, root=0)
+
+print(f"Process {rank} received data and start training.")
+
+# define kernel ridge regression 
+model = KernelRidge(kernel='rbf')
+
+# tuning parameters on rank 0 only
+if rank == 0:
+    param_grid = {
+        'alpha': [0.1, 1],
+        'gamma': [0.01, 0.1]
+    }
+    print("Starting parameter tuning...")
+    try:
+        grid_search = GridSearchCV(model, param_grid, scoring='neg_mean_squared_error', cv=3, n_jobs=-1)
+        grid_search.fit(X_train, y_train)
+        best_params = grid_search.best_params_
+        print(f"Best parameters found: {best_params}")
+    except Exception as e:
+        print(f"Parameter tuning failed: {e}")
+        best_params = {'alpha': 1, 'gamma': 0.1}
+else:
+    best_params = None
+
+# boardcast the best parameter to all processors
+best_params = comm.bcast(best_params, root=0)
+
+# train model using best parameters
+model.set_params(**best_params)
+model.fit(X_train_local, y_train_local)
+
+print(f"Process {rank} completed model training.")
+
+# local prediction
+local_predictions = model.predict(X_train_local)
+
+print(f"Process {rank} completed local prediction.")
+
+# gather all predictions from processes
+try:
+    all_predictions = comm.gather(local_predictions, root=0)
+    if rank == 0:
+        print("Gathered all predictions from processes.")
+except Exception as e:
+    print(f"Process {rank} failed to gather predictions: {e}")
+
+# find and compare the root mean square error.
+if rank == 0:
+    try:
+        y_pred_train = np.concatenate(all_predictions)
+        y_pred_test = model.predict(X_test)
+        rmse_train = np.sqrt(mean_squared_error(y_train, y_pred_train))
+        rmse_test = np.sqrt(mean_squared_error(y_test, y_pred_test))
+        print(f"Training set RMSE: {rmse_train:.2f}")
+        print(f"Testing set RMSE: {rmse_test:.2f}")
+    except Exception as e:
+        print(f"Prediction or evaluation failed: {e}")
+
+#run  by mpiexec -n 4 python 5208_project.py
